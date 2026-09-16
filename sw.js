@@ -1,5 +1,5 @@
 const CACHE_PREFIX = "filament-stock-v2-";
-const CACHE = CACHE_PREFIX + "stock-6";
+const CACHE = CACHE_PREFIX + "hover-7";
 const ASSETS = ["./", "index.html", "app.js", "sync.js", "account.js", "mobile.css", "mobile.js", "manifest.webmanifest", "icon-192.svg", "icon-512.svg", "icon-192.png", "icon-512.png", "apple-touch-icon.png"];
 self.addEventListener("install", event => { event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(ASSETS)).then(()=>self.skipWaiting())); });
 self.addEventListener("activate", event => { event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key.startsWith(CACHE_PREFIX) && key !== CACHE).map(key => caches.delete(key)))).then(() => self.clients.claim())); });
