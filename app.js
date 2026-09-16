@@ -8,16 +8,27 @@ function put(store,obj){return new Promise((res,rej)=>{let r=db.transaction(stor
 function del(store,id){return new Promise((res,rej)=>{let r=db.transaction(store,"readwrite").objectStore(store).delete(id);r.onsuccess=()=>res();r.onerror=()=>rej(r.error)})}
 const uid=()=>crypto.randomUUID?crypto.randomUUID():Date.now()+"-"+Math.random();
 function options(el,arr,allLabel){el.innerHTML=(allLabel?`<option>${allLabel}</option>`:"")+arr.map(x=>`<option>${x}</option>`).join("")}
+const activeSpool=s=>!s.deletedAt&&!s.finishedAt&&s.remaining>0;
+const escapeHTML=value=>String(value??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function lifecycleHistory(spools,movements){
+ const events=[...movements];
+ for(const s of spools){
+  const label=[s.brand,s.material,s.colorName].filter(Boolean).join(" • ");
+  if(s.finishedAt||s.remaining<=0)events.push({date:new Date(s.finishedAt||s.updated||s.created||0).toISOString(),label:"Bobine terminée • "+label,note:"Bobine vide, retirée du stock et de l’étagère.",status:"Terminée"});
+  if(s.deletedAt)events.push({date:new Date(s.deletedAt).toISOString(),label:"Bobine supprimée • "+label,note:"Retirée du stock et de l’étagère.",status:"Supprimée"});
+ }
+ return events.sort((a,b)=>b.date.localeCompare(a.date)).map(m=>`<div class=row><div></div><div><b>${escapeHTML(m.label)}</b><div class=sub>${new Date(m.date).toLocaleString("fr-FR")} ${m.note?"• "+escapeHTML(m.note):""}</div></div><b>${m.status||m.grams+" g"}</b><div></div></div>`).join("")||`<div class=sub>Aucun mouvement.</div>`;
+}
 function pct(s){return Math.max(0,Math.min(100,s.initial?100*s.remaining/s.initial:0))}
 function money(v){return new Intl.NumberFormat("fr-FR",{style:"currency",currency:"EUR"}).format(v)}
 function contrast(hex){let h=hex.replace("#","");let [r,g,b]=[0,2,4].map(i=>parseInt(h.slice(i,i+2),16));return .299*r+.587*g+.114*b>165?"#111":"#fff"}
 function shade(hex,k){let h=hex.replace("#","");return "#"+[0,2,4].map(i=>Math.max(0,Math.min(255,Math.round(parseInt(h.slice(i,i+2),16)*k))).toString(16).padStart(2,"0")).join("")}
 async function render(){
- let sp=await all("spools"), mv=await all("movements"); sp.sort((a,b)=>(a.slot??0)-(b.slot??0));
+ let stored=await all("spools"),sp=stored.filter(activeSpool), mv=await all("movements"); sp.sort((a,b)=>(a.slot??0)-(b.slot??0));
  let grams=sp.reduce((a,s)=>a+s.remaining,0), value=sp.reduce((a,s)=>a+(s.initial?s.remaining/s.initial*s.price:0),0), low=sp.filter(s=>s.remaining<=250).length;
  $("#stats").innerHTML=[["Bobines",sp.length],["Stock restant",(grams/1000).toFixed(2)+" kg"],["Valeur restante",money(value)],["Stock faible",low]].map(x=>`<div class=stat><span class=sub>${x[0]}</span><b>${x[1]}</b></div>`).join("");
  $("#lowList").innerHTML=sp.filter(s=>s.remaining<=250).sort((a,b)=>a.remaining-b.remaining).slice(0,8).map(rowHTML).join("")||`<div class=sub>Aucun stock faible.</div>`;
- renderSpools(sp); renderShelf(sp); $("#history").innerHTML=mv.sort((a,b)=>b.date.localeCompare(a.date)).map(m=>`<div class=row><div></div><div><b>${m.label}</b><div class=sub>${new Date(m.date).toLocaleString("fr-FR")} ${m.note?"• "+m.note:""}</div></div><b>${m.grams} g</b><div></div></div>`).join("")||`<div class=sub>Aucun mouvement.</div>`;
+ renderSpools(sp); renderShelf(sp); $("#history").innerHTML=lifecycleHistory(stored,mv);
 }
 function filtered(sp,prefix=""){
  let q=$("#"+prefix+"Search")?.value.toLowerCase()||"", mat=$("#"+prefix+"Mat")?.value||"Toutes matières", brand=$("#"+prefix+"Brand")?.value||"Toutes les marques", st=$("#"+prefix+"Stock")?.value||"Tous les stocks";
@@ -32,17 +43,33 @@ async function renderShelf(sp){
 function bindDrag(){let dragId=null; $$(".spool").forEach(el=>{el.addEventListener("dragstart",()=>dragId=el.dataset.id);el.addEventListener("click",()=>editSpool(el.dataset.id))});$$(".slot").forEach(z=>{z.addEventListener("dragover",e=>{e.preventDefault();z.classList.add("dragover")});z.addEventListener("dragleave",()=>z.classList.remove("dragover"));z.addEventListener("drop",async e=>{e.preventDefault();z.classList.remove("dragover");if(!dragId)return;await moveTo(dragId,+z.dataset.slot);dragId=null})});
  // touch/pointer drag: long-ish movement and drop by elementFromPoint
  $$(".spool").forEach(el=>{let moved=false;el.addEventListener("pointerdown",e=>{el.setPointerCapture(e.pointerId);moved=false;el._sx=e.clientX;el._sy=e.clientY});el.addEventListener("pointermove",e=>{if(Math.hypot(e.clientX-el._sx,e.clientY-el._sy)>8)moved=true});el.addEventListener("pointerup",async e=>{if(!moved)return;let t=document.elementFromPoint(e.clientX,e.clientY)?.closest(".slot");if(t)await moveTo(el.dataset.id,+t.dataset.slot)})})}
-async function moveTo(id,newSlot){let sp=await all("spools"), s=sp.find(x=>x.id===id);if(!s)return;let old=s.slot??0, other=sp.find(x=>x.id!==id&&(x.slot??0)===newSlot);if(other){other.slot=old;other.updated=Date.now();await put("spools",other)}s.slot=newSlot;s.updated=Date.now();await put("spools",s);render()}
-function openForm(s){$("#modal").classList.remove("hidden");$("#formTitle").textContent=s?"Modifier la bobine":"Nouvelle bobine";$("#editId").value=s?.id||"";$("#brand").value=s?.brand||"Bambu Lab";$("#material").value=s?.material||"PLA";$("#variant").value=s?.variant||"";$("#colorName").value=s?.colorName||"";$("#color").value=s?.color||"#808080";$("#price").value=s?.price??0;$("#initial").value=s?.initial??1000;$("#remaining").value=s?.remaining??1000}
-window.editSpool=async id=>openForm((await all("spools")).find(s=>s.id===id));
-window.consume=async id=>{let s=(await all("spools")).find(x=>x.id===id);$("#consumeId").value=id;$("#consumeLabel").textContent=`${s.brand} • ${s.material} • ${s.colorName||""} — ${s.remaining} g restants`;$("#grams").value="";$("#note").value="";$("#cost").textContent="";$("#consumeModal").classList.remove("hidden")}
-$("#spoolForm").addEventListener("submit",async e=>{e.preventDefault();let sp=await all("spools"),id=$("#editId").value,existing=sp.find(s=>s.id===id),initial=+$("#initial").value,remaining=Math.min(initial,+$("#remaining").value);if(!initial||remaining<0)return alert("Vérifie les poids.");let used=new Set(sp.filter(s=>s.id!==id).map(s=>s.slot));let slot=existing?.slot;if(slot==null){slot=0;while(used.has(slot))slot++}let s={id:id||uid(),brand:$("#brand").value,material:$("#material").value,variant:$("#variant").value.trim(),colorName:$("#colorName").value.trim(),color:$("#color").value,price:+$("#price").value||0,initial,remaining,slot,created:existing?.created||Date.now(),updated:Date.now()};await put("spools",s);$("#modal").classList.add("hidden");render()});
-$("#consumeForm").addEventListener("submit",async e=>{e.preventDefault();let sp=await all("spools"),s=sp.find(x=>x.id===$("#consumeId").value),g=+$("#grams").value;if(!s||g<=0||g>s.remaining)return alert("Quantité incorrecte.");s.remaining-=g;s.updated=Date.now();await put("spools",s);await put("movements",{id:uid(),spoolId:s.id,label:`${s.brand} • ${s.material} • ${s.colorName||""}`,grams:-g,note:$("#note").value.trim(),date:new Date().toISOString()});$("#consumeModal").classList.add("hidden");render()});
+async function moveTo(id,newSlot){let sp=(await all("spools")).filter(activeSpool), s=sp.find(x=>x.id===id);if(!s)return;let old=s.slot??0, other=sp.find(x=>x.id!==id&&(x.slot??0)===newSlot);if(other){other.slot=old;other.updated=Date.now();await put("spools",other)}s.slot=newSlot;s.updated=Date.now();await put("spools",s);render()}
+function openForm(s){$("#deleteSpool").classList.toggle("hidden",!s);$("#modal").classList.remove("hidden");$("#formTitle").textContent=s?"Modifier la bobine":"Nouvelle bobine";$("#editId").value=s?.id||"";$("#brand").value=s?.brand||"Bambu Lab";$("#material").value=s?.material||"PLA";$("#variant").value=s?.variant||"";$("#colorName").value=s?.colorName||"";$("#color").value=s?.color||"#808080";$("#price").value=s?.price??0;$("#initial").value=s?.initial??1000;$("#remaining").value=s?.remaining??1000}
+window.editSpool=async id=>{const s=(await all("spools")).find(s=>s.id===id&&activeSpool(s));if(s)openForm(s);};
+window.deleteSpool=async id=>{
+ const s=(await all("spools")).find(s=>s.id===id);
+ if(!s||s.deletedAt)return;
+ if(!confirm("Supprimer cette bobine du stock ? Son historique sera conservé."))return;
+ s.deletedAt=Date.now();s.updated=s.deletedAt;s.slot=null;
+ await put("spools",s);$("#modal").classList.add("hidden");await render();
+};
+window.consume=async id=>{let s=(await all("spools")).find(x=>x.id===id);if(!s||!activeSpool(s))return;$("#consumeId").value=id;$("#consumeLabel").textContent=`${s.brand} • ${s.material} • ${s.colorName||""} — ${s.remaining} g restants`;$("#grams").value="";$("#note").value="";$("#cost").textContent="";$("#consumeModal").classList.remove("hidden")}
+$("#spoolForm").addEventListener("submit",async e=>{e.preventDefault();let sp=await all("spools"),id=$("#editId").value,existing=sp.find(s=>s.id===id),initial=+$("#initial").value,remaining=Math.min(initial,+$("#remaining").value);if(existing&&!activeSpool(existing))return alert("Cette bobine a été retirée du stock.");if(!initial||remaining<0)return alert("Vérifie les poids.");let used=new Set(sp.filter(s=>s.id!==id&&activeSpool(s)).map(s=>s.slot));let slot=existing?.slot;if(slot==null){slot=0;while(used.has(slot))slot++}let s={...existing,id:id||uid(),brand:$("#brand").value,material:$("#material").value,variant:$("#variant").value.trim(),colorName:$("#colorName").value.trim(),color:$("#color").value,price:+$("#price").value||0,initial,remaining,slot,created:existing?.created||Date.now(),updated:Date.now()};if(s.remaining===0){s.finishedAt=s.updated;s.slot=null;}await put("spools",s);$("#modal").classList.add("hidden");render()});
+$("#consumeForm").addEventListener("submit",async e=>{e.preventDefault();let sp=await all("spools"),s=sp.find(x=>x.id===$("#consumeId").value),g=+$("#grams").value;if(!s||!activeSpool(s)||g<=0||g>s.remaining)return alert("Quantité incorrecte.");s.remaining=Math.max(0,Math.round((s.remaining-g)*1000000)/1000000);s.updated=Date.now();if(s.remaining===0){s.finishedAt=s.updated;s.slot=null;}await saveConsumption(s,{id:uid(),spoolId:s.id,label:`${s.brand} • ${s.material} • ${s.colorName||""}`,grams:-g,note:$("#note").value.trim(),date:new Date().toISOString()});$("#consumeModal").classList.add("hidden");render()});
 $("#grams").addEventListener("input",async()=>{let s=(await all("spools")).find(x=>x.id===$("#consumeId").value),g=+$("#grams").value||0;$("#cost").textContent=s?`Coût matière estimé : ${money(s.price/s.initial*g)}`:""});
+$("#deleteSpool").onclick=()=>deleteSpool($("#editId").value);
 $("#cancel").onclick=()=>$("#modal").classList.add("hidden");$("#consumeCancel").onclick=()=>$("#consumeModal").classList.add("hidden");$$(".add").forEach(b=>b.onclick=()=>openForm());
 $$("nav button").forEach(b=>b.onclick=()=>{$$("nav button").forEach(x=>x.classList.remove("active"));b.classList.add("active");$$("main>section").forEach(s=>s.classList.add("hidden"));$("#"+b.dataset.view+"View").classList.remove("hidden");render()});
 ["search","matFilter","brandFilter","stockFilter","shelfSearch","shelfMat","shelfBrand","shelfStock"].forEach(id=>$("#"+id)?.addEventListener(id.includes("Search")||id==="search"?"input":"change",render));
 $("#exportBtn").onclick=async()=>{let data={version:2,spools:await all("spools"),movements:await all("movements")},blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"}),a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="filament-stock-backup.json";a.click();URL.revokeObjectURL(a.href)};
-$("#importFile").onchange=async e=>{let f=e.target.files[0];if(!f)return;try{let d=JSON.parse(await f.text());for(let s of d.spools||[])await put("spools",s);for(let m of d.movements||[])await put("movements",m);render()}catch{alert("Fichier invalide.")}};
+$("#importFile").onchange=async e=>{let f=e.target.files[0];if(!f)return;try{let d=JSON.parse(await f.text());const existing=new Map((await all("spools")).map(s=>[s.id,s]));for(let s of d.spools||[]){const old=existing.get(s.id);if(old?.deletedAt||old?.finishedAt)continue;await put("spools",s);}for(let m of d.movements||[])await put("movements",m);render()}catch{alert("Fichier invalide.")}};
 function net(){let el=$("#syncState");el.textContent=navigator.onLine?"● En ligne • données locales":"● Hors connexion • données locales";el.className="sync "+(navigator.onLine?"online":"offline")}addEventListener("online",net);addEventListener("offline",net);
 (async()=>{options($("#brand"),BRANDS);options($("#material"),MATERIALS);options($("#matFilter"),MATERIALS,"Toutes matières");options($("#brandFilter"),BRANDS,"Toutes les marques");options($("#shelfMat"),MATERIALS,"Toutes matières");options($("#shelfBrand"),BRANDS,"Toutes les marques");await openDB();net();render();if("serviceWorker"in navigator)navigator.serviceWorker.register("sw.js").catch(()=>{})})();
+function saveConsumption(spool,movement){
+ return new Promise((resolve,reject)=>{
+  const tx=db.transaction(["spools","movements"],"readwrite");
+  tx.objectStore("spools").put(spool);tx.objectStore("movements").put(movement);
+  tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error);
+ });
+}
+

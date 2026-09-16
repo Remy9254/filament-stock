@@ -64,16 +64,29 @@ async function signOut(){
 
 function dbAll(store){return new Promise((res,rej)=>{let r=db.transaction(store).objectStore(store).getAll();r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
 function dbPut(store,obj){return new Promise((res,rej)=>{let r=db.transaction(store,'readwrite').objectStore(store).put(obj);r.onsuccess=()=>res();r.onerror=()=>rej(r.error)})}
-function spoolToCloud(s){return {id:s.id,brand:s.brand||'',material:s.material||'',variant:s.variant||'',color_name:s.colorName||'',color:s.color||'#808080',initial_weight:+s.initial||1000,remaining_weight:+s.remaining||0,price:+s.price||0,opened:s.opened!==false,shelf_slot:s.slot??null,created_at:new Date(s.created||Date.now()).toISOString()}}
-function spoolFromCloud(s){return {id:s.id,brand:s.brand,material:s.material,variant:s.variant||'',colorName:s.color_name||'',color:s.color||'#808080',initial:+s.initial_weight,remaining:+s.remaining_weight,price:+s.price,opened:s.opened,slot:s.shelf_slot,created:Date.parse(s.created_at),updated:Date.parse(s.updated_at)}}
+function spoolToCloud(s){return {id:s.id,brand:s.brand||'',material:s.material||'',variant:s.variant||'',color_name:s.colorName||'',color:s.color||'#808080',initial_weight:+s.initial||1000,remaining_weight:+s.remaining||0,price:+s.price||0,opened:s.opened!==false,shelf_slot:activeSpool(s)?s.slot??null:null,deleted_at:s.deletedAt?new Date(s.deletedAt).toISOString():null,finished_at:s.finishedAt?new Date(s.finishedAt).toISOString():null,created_at:new Date(s.created||Date.now()).toISOString()}}
+function spoolFromCloud(s){return {id:s.id,brand:s.brand,material:s.material,variant:s.variant||'',colorName:s.color_name||'',color:s.color||'#808080',initial:+s.initial_weight,remaining:+s.remaining_weight,price:+s.price,opened:s.opened,slot:s.shelf_slot,deletedAt:s.deleted_at?Date.parse(s.deleted_at):null,finishedAt:s.finished_at?Date.parse(s.finished_at):null,created:Date.parse(s.created_at),updated:Date.parse(s.updated_at)}}
 function movementToCloud(m){return {id:m.id,spool_id:m.spoolId||null,spool_label:m.label||'',grams:+m.grams||-0.001,cost:+m.cost||0,note:m.note||'',created_at:m.date||new Date().toISOString()}}
 function movementFromCloud(m){return {id:m.id,spoolId:m.spool_id,label:m.spool_label||'',grams:+m.grams,cost:+m.cost,note:m.note||'',date:m.created_at,updated:Date.parse(m.updated_at)}}
 async function restGet(table,token){let r=await fetch(`${CLOUD_URL}/rest/v1/${table}?select=*`,{headers:cloudHeaders(token)});if(!r.ok)throw new Error('Lecture cloud impossible');return r.json()}
 async function restUpsert(table,obj,token){let r=await fetch(`${CLOUD_URL}/rest/v1/${table}?on_conflict=id`,{method:'POST',headers:cloudHeaders(token,{'Prefer':'resolution=merge-duplicates,return=minimal'}),body:JSON.stringify(obj)});if(!r.ok){let t=await r.text();throw new Error(t||'Écriture cloud impossible')}}
 
-async function mergeStore(store,table,toCloud,fromCloud,token){let local=await dbAll(store),remote=await restGet(table,token),lm=new Map(local.map(x=>[x.id,x])),rm=new Map(remote.map(x=>[x.id,x]));
- for(let l of local){let r=rm.get(l.id);if(!r){await restUpsert(table,toCloud(l),token);continue}let lt=+(l.updated||l.created||0),rt=Date.parse(r.updated_at);if(lt>rt+1000){await restUpsert(table,toCloud(l),token)}else if(rt>lt){await dbPut(store,fromCloud(r))}}
- for(let r of remote)if(!lm.has(r.id))await dbPut(store,fromCloud(r));
+// Compare inside the write transaction: an edit made during a cloud request wins locally.
+function applyRemote(store,remote,expected){return new Promise((resolve,reject)=>{
+ const tx=db.transaction(store,'readwrite'),objects=tx.objectStore(store),request=objects.get(remote.id);
+ request.onsuccess=()=>{if(JSON.stringify(request.result)===JSON.stringify(expected))objects.put(remote);};
+ tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error);
+})}
+async function mergeStore(store,table,toCloud,fromCloud,token){let remote=await restGet(table,token),local=await dbAll(store),lm=new Map(local.map(x=>[x.id,x])),rm=new Map(remote.map(x=>[x.id,x]));
+ for(let l of local){let r=rm.get(l.id);if(!r){await restUpsert(table,toCloud(l),token);continue}if(store==='spools'){
+   const remoteSpool=fromCloud(r);
+   if(remoteSpool.deletedAt){await applyRemote(store,remoteSpool,l);continue;}
+   if(l.deletedAt){await restUpsert(table,toCloud(l),token);continue;}
+   if(remoteSpool.finishedAt||remoteSpool.remaining<=0){await applyRemote(store,remoteSpool,l);continue;}
+   if(l.finishedAt||l.remaining<=0){await restUpsert(table,toCloud(l),token);continue;}
+  }
+  let lt=+(l.updated||l.created||0),rt=Date.parse(r.updated_at);if(lt>rt+1000){await restUpsert(table,toCloud(l),token)}else if(rt>lt){await applyRemote(store,fromCloud(r),l)}}
+ for(let r of remote)if(!lm.has(r.id))await applyRemote(store,fromCloud(r),undefined);
 }
 async function syncCloud(force=false){if(cloudBusy||accountBusy||!accountReady||recoveryActive||!navigator.onLine)return;let s=await refreshSession();if(!s){setCloudState('En ligne • cloud non connecté','');return}cloudBusy=true;setCloudState('Synchronisation…','');try{await mergeStore('spools','spools',spoolToCloud,spoolFromCloud,s.access_token);await mergeStore('movements','movements',movementToCloud,movementFromCloud,s.access_token);setCloudState('Synchronisé à l’instant','online');if(typeof render==='function')await render()}catch(e){console.error(e);setCloudState('Cloud indisponible • données locales','offline')}finally{cloudBusy=false}}
 
@@ -81,3 +94,4 @@ window.addEventListener('online',()=>setTimeout(()=>syncCloud(),500));
 window.addEventListener('offline',()=>setCloudState('Hors connexion • données locales','offline'));
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)syncCloud()});
 setInterval(()=>syncCloud(),15000);
+
